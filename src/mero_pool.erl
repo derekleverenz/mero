@@ -63,6 +63,9 @@
                   %% Busy connections (pid -> #conn)
                   busy :: dict:dict(),
 
+                  %% queued connection attempts waiting for a socket
+                  waiting :: queue(),
+
                   %% Number of connections established (busy + free)
                   num_connected :: non_neg_integer(),
 
@@ -170,6 +173,7 @@ init(Parent, ClusterName, Host, Port, PoolName, WrkModule) ->
             State = #pool_st{
                        cluster = ClusterName,
                        free = [],
+                       waiting = queue:new(),
                        host = Host,
                        port = Port,
                        min_connections =
@@ -204,6 +208,7 @@ state(PoolName) ->
              {links, length(Links)},
              {monitors, length(Monitors)},
              {free, length(State#pool_st.free)},
+             {waiting, length(State#pool_st.waiting)},
              {num_connected, State#pool_st.num_connected},
              {num_connecting, State#pool_st.num_connecting},
 
@@ -243,7 +248,7 @@ pool_loop(State, Parent, Deb) ->
                     ?MODULE:pool_loop(State, Parent, Deb)
             end;
         {checkout, From} ->
-            ?MODULE:pool_loop(get_connection(State, From), Parent, Deb);
+            ?MODULE:pool_loop(handle_checkout(State, From), Parent, Deb);
         {checkin, Pid, Conn} ->
             ?MODULE:pool_loop(checkin(State, Pid, Conn), Parent, Deb);
         {checkin_closed, Pid} ->
@@ -269,11 +274,13 @@ pool_loop(State, Parent, Deb) ->
     end.
 
 
-get_connection(#pool_st{free = Free} = State, From) when Free /= [] ->
+handle_checkout(#pool_st{free = Free} = State, From) when Free /= [] ->
     give(State, From);
-get_connection(State, {Pid, Ref} = _From) ->
-    safe_send(Pid, {Ref, {reject, State}}),
-    maybe_spawn_connect(State).
+handle_checkout(#pool_st{waiting = Waiting} = State, From) ->
+    maybe_spawn_connect(State#pool_st{waiting = queue:in(Waiting, From)}).
+%%handle_checkout(State, {Pid, Ref} = _From) ->
+%%    safe_send(Pid, {Ref, {reject, State}}),
+%%    maybe_spawn_connect(State).
 
 
 maybe_spawn_connect(#pool_st{
@@ -329,10 +336,11 @@ connect_success(#pool_st{free = Free,
                          num_connected = Num,
                          num_connecting = NumConnecting} = State,
                 Conn) ->
-    State#pool_st{free = [Conn|Free],
-                           num_connected = Num + 1,
-                           num_connecting = NumConnecting - 1,
-                           num_failed_connecting = 0}.
+    NewState = State#pool_st{free = [Conn|Free],
+                             num_connected = Num + 1,
+                             num_connecting = NumConnecting - 1,
+                             num_failed_connecting = 0},
+    grant_waiting(NewState).
 
 
 connect_failed(#pool_st{num_connecting = Num,
@@ -345,8 +353,8 @@ checkin(#pool_st{busy = Busy, free = Free} = State, Pid, Conn) ->
     case dict:find(Pid, Busy) of
         {ok, {MRef, _}} ->
             erlang:demonitor(MRef),
-            State#pool_st{busy = dict:erase(Pid, Busy),
-                          free = [Conn|Free]};
+            grant_waiting(#pool_st{busy = dict:erase(Pid, Busy),
+                                   free = [Conn|Free]});
         error ->
             State
     end.
@@ -505,3 +513,11 @@ is_config_valid() ->
                {initial_connections, Initial}]),
             false
     end.
+
+grant_waiting(#pool_st{waiting = Waiting} = State) ->
+  case queue:out(Waiting) of
+     {value, From, LeftWaiting} ->
+         give(State#pool_st{waiting = LeftWaiting}, From);
+     {empty, _} ->
+         State
+  end.
